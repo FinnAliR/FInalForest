@@ -4,6 +4,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from PIL import Image
 from datetime import datetime
+import rasterio
+import re
+from collections import defaultdict
 
 # Configuration
 PIXEL_SIZE_SQ_M = 100  # Example: 10m x 10m resolution = 100 square meters per pixel
@@ -26,15 +29,21 @@ import sys
 print(sys.executable)
 
 def process_image(image_path, date_label):
-    """Reads an image and counts pixel areas per class."""
-    img = Image.open(image_path)
-    img_array = np.array(img)
+    """Reads a single-band GeoTIFF or PNG and counts pixel areas per class."""
+    ext = os.path.splitext(image_path)[1].lower()
+
+    if ext in [".tif", ".tiff"]:
+        with rasterio.open(image_path) as src:
+            img_array = src.read(1)  # Read first band
+    else:
+        img = Image.open(image_path)
+        img_array = np.array(img)
 
     counts = {}
     for class_value, class_name in CLASS_MAPPING.items():
         pixel_count = np.sum(img_array == class_value)
         area_sqm = pixel_count * PIXEL_SIZE_SQ_M
-        area_sqkm = area_sqm / 1e6  # Convert to square kilometers
+        area_sqkm = area_sqm / 1e6
         counts[class_name] = area_sqkm
 
     counts['Date'] = date_label
@@ -42,33 +51,38 @@ def process_image(image_path, date_label):
 
 
 def process_folder(folder_path):
-    """Processes all images in a folder."""
-    all_records = []
+    """Processes all images in a folder, including Earth Engine-tiled GeoTIFFs."""
+    grouped_records = defaultdict(list)
 
     for filename in os.listdir(folder_path):
-        if filename.endswith(".png") or filename.endswith(".tif"):
+        if filename.lower().endswith((".png", ".tif", ".tiff")):
             try:
-                date_str = filename.split('.')[0]  # expects 'YYYY-MM.png'
-                try:
-                    date_label = datetime.strptime(date_str, "%Y-%m")
-                except ValueError:
-                    date_label = datetime.strptime(date_str, "%Y")
+                # Match YYYY-MM pattern from filename
+                match = re.search(r'(\d{4}-\d{2})', filename)
+                if not match:
+                    raise ValueError("No date pattern found in filename")
 
-                record = process_image(os.path.join(folder_path, filename), date_label)
-                all_records.append(record)
+                date_str = match.group(1)
+                date_label = datetime.strptime(date_str, "%Y-%m")
+                image_path = os.path.join(folder_path, filename)
+                record = process_image(image_path, date_label)
+                grouped_records[date_label].append(record)
 
             except Exception as e:
                 print(f"[Warning] Skipping file {filename}: {e}")
 
-    if not all_records:
-        raise ValueError("No valid image records found in folder. Check filenames and format (e.g., 2023-01.png)")
+    if not grouped_records:
+        raise ValueError("No valid image records found in folder.")
 
-    df = pd.DataFrame(all_records)
+    # Merge tiles per date
+    merged = []
+    for date_label, records in grouped_records.items():
+        merged_record = {'Date': date_label}
+        for class_name in CLASS_MAPPING.values():
+            merged_record[class_name] = sum(r.get(class_name, 0) for r in records)
+        merged.append(merged_record)
 
-    if 'Date' not in df.columns:
-        print("DEBUG: DataFrame columns:", df.columns)
-        raise KeyError("'Date' column missing in DataFrame. Check filename format.")
-
+    df = pd.DataFrame(merged)
     df = df.sort_values('Date')
     return df
 

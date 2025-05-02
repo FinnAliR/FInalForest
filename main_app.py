@@ -1,23 +1,16 @@
 import tkinter as tk
+from datetime import date
 from tkinter import ttk, messagebox
+
+from dateutil.relativedelta import relativedelta
+
 from classifier import ClassificationApp
 from graph_viewer import GraphViewer
 from exporter import export_monthly_landcover
 import threading
+import ee
 import time
 import os
-
-# Import Earth Engine with Windows compatibility
-try:
-    import ee
-    ee.Initialize()
-except ImportError:
-    print("Please install the Earth Engine API using: pip install earthengine-api")
-    exit(1)
-except Exception as e:
-    print(f"Earth Engine initialization error: {e}")
-    print("Please authenticate using: ee.Authenticate()")
-    exit(1)
 
 class LandApp:
     def __init__(self, root):
@@ -38,27 +31,12 @@ class LandApp:
 
         # Modules
         self.classifier = ClassificationApp(self.left_panel, self.right_panel, self.log_status)
-        self.graph_viewer = GraphViewer(self.left_panel, self.right_panel)
+        self.graph_viewer = GraphViewer(self.left_panel, self.right_panel, self.log_status)
 
         self._setup_batch_export_controls()
 
     def _setup_batch_export_controls(self):
         ttk.Label(self.left_panel, text="\nBatch Export", font=("Helvetica", 14, "bold")).pack(pady=10)
-
-        self.country_entry = ttk.Entry(self.left_panel)
-        self.country_entry.insert(0, "United Kingdom")
-        ttk.Label(self.left_panel, text="Country").pack()
-        self.country_entry.pack()
-
-        self.start_entry = ttk.Entry(self.left_panel)
-        self.start_entry.insert(0, "2023-01-01")
-        ttk.Label(self.left_panel, text="Start Date (YYYY-MM-DD)").pack()
-        self.start_entry.pack()
-
-        self.end_entry = ttk.Entry(self.left_panel)
-        self.end_entry.insert(0, "2023-12-31")
-        ttk.Label(self.left_panel, text="End Date (YYYY-MM-DD)").pack()
-        self.end_entry.pack()
 
         self.auto_refresh_var = tk.BooleanVar()
         ttk.Checkbutton(self.left_panel, text="Auto-refresh graph when done", variable=self.auto_refresh_var).pack(pady=5)
@@ -69,14 +47,38 @@ class LandApp:
         self.status_text.insert(tk.END, message + "\n")
         self.status_text.see(tk.END)
 
+    def load_country_list(self):
+        try:
+            countries = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
+            names = countries.aggregate_array("country_na").getInfo()
+            unique_names = sorted(set(names))
+            self.country_dropdown['values'] = unique_names
+        except Exception as e:
+            self.log_status(f"[ERROR] Could not load country list: {e}")
+            self.country_dropdown['values'] = ["United Kingdom"]
+
+    def _update_date_range(self):
+        selected = self.range_var.get()
+        months = self.range_options.get(selected, 12)
+        end_date = date.today()
+        start_date = end_date - relativedelta(months=months)
+
+        self.start_entry.delete(0, tk.END)
+        self.start_entry.insert(0, start_date.strftime("%Y-%m-%d"))
+
+        self.end_entry.delete(0, tk.END)
+        self.end_entry.insert(0, end_date.strftime("%Y-%m-%d"))
+
+        self.log_status(f"Date range set: {start_date} to {end_date}")
+
     def run_batch_export(self):
         threading.Thread(target=self._batch_export_thread, daemon=True).start()
 
     def _batch_export_thread(self):
         self.status_text.delete("1.0", tk.END)
-        country = self.country_entry.get()
-        start = self.start_entry.get()
-        end = self.end_entry.get()
+        country = self.classifier.country_var.get()
+        start = self.classifier.start_date.get()
+        end = self.classifier.end_date.get()
 
         try:
             tasks = export_monthly_landcover(country, start, end, project_id='final-project-jpp317487')
@@ -91,7 +93,14 @@ class LandApp:
                 status_summary = "\nTask Status:\n"
                 for t in ee.batch.Task.list():
                     status = t.status()
-                    status_summary += f"{status['description']}: {status['state']}\n"
+                    description = status.get('description', 'No description')
+                    state = status.get('state', 'UNKNOWN')
+                    error = status.get('error_message', '')
+                    status_summary += f"{description}: {state}"
+                    if error:
+                        status_summary += f" [Error: {error}]"
+                    status_summary += "\n"
+
                 self.log_status(status_summary)
                 if not active_tasks:
                     self.log_status("\nAll tasks completed.")
