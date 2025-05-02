@@ -13,9 +13,10 @@ except Exception as e:
     ee.Initialize(project='final-project-jpp317487')
 
 class ClassificationApp:
-    def __init__(self, control_frame, display_frame):
+    def __init__(self, control_frame, display_frame, log_callback=None):
         self.control_frame = control_frame
         self.display_frame = display_frame
+        self.log = log_callback if log_callback else print
         self.map = geemap.Map()
         self.temp_html = tempfile.mktemp(suffix=".html")
 

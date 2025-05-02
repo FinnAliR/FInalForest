@@ -1,5 +1,4 @@
 import ee
-import os
 from datetime import datetime, timedelta
 
 def export_image_to_drive(image, region, filename_prefix, folder='EarthEngineExports', scale=10):
@@ -15,12 +14,12 @@ def export_image_to_drive(image, region, filename_prefix, folder='EarthEngineExp
     task.start()
     return task
 
-def export_monthly_landcover(country_name, start_date_str, end_date_str):
+def export_monthly_landcover(country_name, start_date_str, end_date_str, project_id='final-project-jpp317487'):
     """
     Batch export of land cover images per month to Google Drive.
     Date format: YYYY-MM-DD
     """
-    ee.Initialize()
+    ee.Initialize(project=project_id)
     countries = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
     roi = countries.filter(ee.Filter.eq("country_na", country_name))
 
