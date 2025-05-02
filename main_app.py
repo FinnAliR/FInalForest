@@ -13,6 +13,10 @@ import time
 import os
 
 class LandApp:
+    def log_status(self, message):
+        self.status_text.insert(tk.END, message + "\n")
+        self.status_text.see(tk.END)
+
     def __init__(self, root):
         self.root = root
         self.root.title("Land Cover Classification")
@@ -38,14 +42,33 @@ class LandApp:
     def _setup_batch_export_controls(self):
         ttk.Label(self.left_panel, text="\nBatch Export", font=("Helvetica", 14, "bold")).pack(pady=10)
 
+        notebook = ttk.Notebook(self.left_panel)
+        notebook.pack(fill='both', expand=False, pady=5)
+
+        # --- Tab 1: Google Drive ---
+        self.tab_drive = ttk.Frame(notebook)
+        notebook.add(self.tab_drive, text="Export to Drive")
+
         self.auto_refresh_var = tk.BooleanVar()
-        ttk.Checkbutton(self.left_panel, text="Auto-refresh graph when done", variable=self.auto_refresh_var).pack(pady=5)
+        ttk.Checkbutton(self.tab_drive, text="Auto-refresh graph when done", variable=self.auto_refresh_var).pack(
+            pady=5)
+        ttk.Button(self.tab_drive, text="Export Monthly Images to Drive", command=self.run_batch_export).pack(pady=5)
 
-        ttk.Button(self.left_panel, text="Export Monthly Images to Drive", command=self.run_batch_export).pack(pady=5)
+        # --- Tab 2: Local Export ---
+        self.tab_local = ttk.Frame(notebook)
+        notebook.add(self.tab_local, text="Export to Local")
 
-    def log_status(self, message):
-        self.status_text.insert(tk.END, message + "\n")
-        self.status_text.see(tk.END)
+        ttk.Label(self.tab_local, text="Output Folder").pack()
+        self.output_folder_entry = ttk.Entry(self.tab_local, width=30)
+        self.output_folder_entry.insert(0, "./classified_exports")
+        self.output_folder_entry.pack(pady=5)
+
+        ttk.Label(self.tab_local, text="Resolution (meters)").pack()
+        self.local_scale_entry = ttk.Entry(self.tab_local, width=10)
+        self.local_scale_entry.insert(0, "10")
+        self.local_scale_entry.pack(pady=5)
+
+        ttk.Button(self.tab_local, text="Export Locally", command=self.run_local_export).pack(pady=5)
 
     def load_country_list(self):
         try:
@@ -113,6 +136,68 @@ class LandApp:
         except Exception as e:
             messagebox.showerror("Export Failed", str(e))
             self.log_status(f"Error: {str(e)}")
+
+    def run_local_export(self):
+        threading.Thread(target=self._local_export_thread, daemon=True).start()
+
+    def _local_export_thread(self):
+        self.status_text.delete("1.0", tk.END)
+        country = self.classifier.country_var.get()
+        start_date = self.classifier.start_date.get()
+        end_date = self.classifier.end_date.get()
+        scale = int(self.local_scale_entry.get())
+        output_folder = self.output_folder_entry.get()
+
+        os.makedirs(output_folder, exist_ok=True)
+
+        self.log_status(f"Starting local export to: {output_folder}")
+        self.log_status(f"Country: {country}, Range: {start_date} to {end_date}, Scale: {scale}m")
+
+        try:
+            ee.Initialize(project='final-project-jpp317487')
+            countries = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
+            roi = countries.filter(ee.Filter.eq("country_na", country))
+
+            from datetime import datetime, timedelta
+            current = datetime.strptime(start_date, "%Y-%m-%d")
+            end = datetime.strptime(end_date, "%Y-%m-%d")
+
+            while current <= end:
+                next_month = (current.replace(day=28) + timedelta(days=4)).replace(day=1)
+                label = current.strftime("%Y-%m")
+
+                collection = ee.ImageCollection('projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m_TS') \
+                    .filterDate(current.strftime("%Y-%m-%d"), next_month.strftime("%Y-%m-%d"))
+
+                if collection.size().getInfo() == 0:
+                    self.log_status(f"[Skipped] No data for {label}")
+                else:
+                    image = collection.mosaic().remap(
+                        [1, 2, 3, 5, 7, 8, 9, 10, 11],
+                        [1, 2, 3, 4, 5, 6, 7, 8, 9]
+                    ).rename('lc')
+
+                    path = os.path.join(output_folder, f"land_cover_{country.replace(' ', '_')}_{label}.tif")
+                    url = image.clip(roi.geometry()).getDownloadURL({
+                        'region': roi.geometry(),
+                        'scale': scale,
+                        'format': 'GeoTIFF'
+                    })
+
+                    # Download the file
+                    import urllib.request
+                    self.log_status(f"Downloading {label}...")
+                    urllib.request.urlretrieve(url, path)
+                    self.log_status(f"Saved: {path}")
+
+                current = next_month
+
+            self.log_status("Local export complete.")
+
+        except Exception as e:
+            self.log_status(f"[ERROR] {e}")
+            messagebox.showerror("Local Export Failed", str(e))
+
 
 if __name__ == "__main__":
     root = tk.Tk()
