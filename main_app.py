@@ -1,5 +1,6 @@
 import tkinter as tk
-from datetime import date
+import urllib
+from datetime import date, datetime, timedelta
 from tkinter import ttk, messagebox
 
 from dateutil.relativedelta import relativedelta
@@ -39,6 +40,9 @@ class LandApp:
 
         self._setup_batch_export_controls()
 
+        self.tile_size_deg = 2.0
+        self.default_scale = 10
+
     def _setup_batch_export_controls(self):
         ttk.Label(self.left_panel, text="\nBatch Export", font=("Helvetica", 14, "bold")).pack(pady=10)
 
@@ -63,12 +67,37 @@ class LandApp:
         self.output_folder_entry.insert(0, "./classified_exports")
         self.output_folder_entry.pack(pady=5)
 
-        ttk.Label(self.tab_local, text="Resolution (meters)").pack()
-        self.local_scale_entry = ttk.Entry(self.tab_local, width=10)
-        self.local_scale_entry.insert(0, "10")
-        self.local_scale_entry.pack(pady=5)
-
+        ttk.Button(self.tab_local, text="Set Export Options", command=self._show_export_options).pack(pady=2)
         ttk.Button(self.tab_local, text="Export Locally", command=self.run_local_export).pack(pady=5)
+
+    def _show_export_options(self):
+        win = tk.Toplevel(self.root)
+        win.title("Export Options")
+        win.geometry("300x180")
+
+        ttk.Label(win, text="Tile Size (degrees):").pack(pady=5)
+        tile_entry = ttk.Entry(win)
+        tile_entry.insert(0, str(self.tile_size_deg))
+        tile_entry.pack()
+
+        ttk.Label(win, text="Resolution (m):").pack(pady=5)
+        scale_entry = ttk.Entry(win)
+        scale_entry.insert(0, str(self.default_scale))
+        scale_entry.pack()
+
+        def save_settings():
+            try:
+                self.tile_size_deg = float(tile_entry.get())
+                self.default_scale = int(scale_entry.get())
+                messagebox.showinfo("Saved", "Export settings updated.")
+                win.destroy()
+            except:
+                messagebox.showerror("Invalid Input", "Please enter valid numbers.")
+
+        ttk.Button(win, text="Save", command=save_settings).pack(pady=10)
+        ttk.Button(win, text="Reset Defaults",
+                   command=lambda: [tile_entry.delete(0, tk.END), tile_entry.insert(0, "2.0"),
+                                    scale_entry.delete(0, tk.END), scale_entry.insert(0, "10")]).pack()
 
     def load_country_list(self):
         try:
@@ -141,24 +170,33 @@ class LandApp:
         threading.Thread(target=self._local_export_thread, daemon=True).start()
 
     def _local_export_thread(self):
+        from shapely.geometry import box
+
         self.status_text.delete("1.0", tk.END)
         country = self.classifier.country_var.get()
         start_date = self.classifier.start_date.get()
         end_date = self.classifier.end_date.get()
-        scale = int(self.local_scale_entry.get())
         output_folder = self.output_folder_entry.get()
+        tile_deg = self.tile_size_deg
+        scale = self.default_scale
 
         os.makedirs(output_folder, exist_ok=True)
 
-        self.log_status(f"Starting local export to: {output_folder}")
-        self.log_status(f"Country: {country}, Range: {start_date} to {end_date}, Scale: {scale}m")
-
+        self.log_status(f"Starting tiled local export to: {output_folder}")
         try:
             ee.Initialize(project='final-project-jpp317487')
             countries = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
-            roi = countries.filter(ee.Filter.eq("country_na", country))
+            roi = countries.filter(ee.Filter.eq("country_na", country)).geometry()
+            bounds = roi.bounds().coordinates().get(0).getInfo()
 
-            from datetime import datetime, timedelta
+            lons = [pt[0] for pt in bounds]
+            lats = [pt[1] for pt in bounds]
+            minx, maxx = min(lons), max(lons)
+            miny, maxy = min(lats), max(lats)
+
+            x_tiles = int((maxx - minx) // tile_deg) + 1
+            y_tiles = int((maxy - miny) // tile_deg) + 1
+
             current = datetime.strptime(start_date, "%Y-%m-%d")
             end = datetime.strptime(end_date, "%Y-%m-%d")
 
@@ -171,32 +209,42 @@ class LandApp:
 
                 if collection.size().getInfo() == 0:
                     self.log_status(f"[Skipped] No data for {label}")
-                else:
-                    image = collection.mosaic().remap(
-                        [1, 2, 3, 5, 7, 8, 9, 10, 11],
-                        [1, 2, 3, 4, 5, 6, 7, 8, 9]
-                    ).rename('lc')
+                    current = next_month
+                    continue
 
-                    path = os.path.join(output_folder, f"land_cover_{country.replace(' ', '_')}_{label}.tif")
-                    url = image.clip(roi.geometry()).getDownloadURL({
-                        'region': roi.geometry(),
-                        'scale': scale,
-                        'format': 'GeoTIFF'
-                    })
+                image = collection.mosaic().remap(
+                    [1, 2, 3, 5, 7, 8, 9, 10, 11],
+                    [1, 2, 3, 4, 5, 6, 7, 8, 9]
+                ).rename('lc')
 
-                    # Download the file
-                    import urllib.request
-                    self.log_status(f"Downloading {label}...")
-                    urllib.request.urlretrieve(url, path)
-                    self.log_status(f"Saved: {path}")
+                for i in range(x_tiles):
+                    for j in range(y_tiles):
+                        tile_geom = ee.Geometry.Rectangle([minx + i * tile_deg, miny + j * tile_deg,
+                                                           min(minx + (i + 1) * tile_deg, maxx),
+                                                           min(miny + (j + 1) * tile_deg, maxy)])
+
+                        filename = f"land_cover_{country.replace(' ', '_')}_{label}_tile_{i}_{j}.tif"
+                        path = os.path.join(output_folder, filename)
+
+                        try:
+                            url = image.clip(tile_geom).getDownloadURL({
+                                'region': tile_geom,
+                                'scale': scale,
+                                'format': 'GeoTIFF'
+                            })
+
+                            self.log_status(f"Downloading {filename}...")
+                            urllib.request.urlretrieve(url, path)
+                            self.log_status(f"Saved: {path}")
+                        except Exception as e:
+                            self.log_status(f"[Tile Failed] {filename}: {e}")
 
                 current = next_month
 
-            self.log_status("Local export complete.")
-
+            self.log_status("✅ Tiled local export complete.")
         except Exception as e:
             self.log_status(f"[ERROR] {e}")
-            messagebox.showerror("Local Export Failed", str(e))
+            messagebox.showerror("Export Error", str(e))
 
 
 if __name__ == "__main__":

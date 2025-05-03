@@ -1,7 +1,7 @@
 import os
 import pandas as pd
 import matplotlib.pyplot as plt
-from tkinter import ttk
+from tkinter import ttk, filedialog
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from area_count_graph import process_folder, plot_area
 
@@ -10,16 +10,24 @@ class GraphViewer:
         self.control_frame = control_frame
         self.display_frame = display_frame
         self.log = log_callback if log_callback else print
+        self.folder = "classified_maps"
         self._setup_controls()
 
     def _setup_controls(self):
         ttk.Label(self.control_frame, text="Graph Viewer", font=("Helvetica", 14, "bold")).pack(pady=(20, 5))
+        ttk.Button(self.control_frame, text="Choose Folder", command=self._choose_folder).pack(pady=3)
         ttk.Button(self.control_frame, text="Load Area Graph", command=self.load_graph).pack(pady=5)
+
+    def _choose_folder(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.folder = folder
+            self.log(f"Selected folder: {folder}")
 
     def load_graph(self):
         try:
-            self.log("Loading and processing classified images...")
-            df = process_folder("classified_maps")
+            self.log(f"Loading and processing images from: {self.folder}")
+            df = process_folder(self.folder)
             self.log("Generating graph...")
 
             fig = self._generate_plot(df)
