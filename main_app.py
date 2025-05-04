@@ -6,6 +6,7 @@ from dateutil.relativedelta import relativedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.error
 import random
+import requests
 from classifier import ClassificationApp
 from graph_creator import GraphCreator
 from exporter import export_yearly_landcover
@@ -233,25 +234,32 @@ class LandApp:
         self.progress_bar.update_idletasks()
         os.makedirs(output_folder, exist_ok=True)
 
-        def download_tile(url, path, filename, max_retries=5):
+        def download_tile(image, tile_geom, path, filename, max_retries=5):
             attempt = 0
             while attempt < max_retries:
                 try:
-                    urllib.request.urlretrieve(url, path)
+                    url = image.clip(tile_geom).getDownloadURL({
+                        'region': tile_geom,
+                        'scale': scale,
+                        'format': 'GeoTIFF'
+                    })
+                    with requests.get(url, stream=True) as r:
+                        r.raise_for_status()
+                        with open(path, 'wb') as f:
+                            for chunk in r.iter_content(chunk_size=8192):
+                                f.write(chunk)
                     self.log_status(f"Saved: {path}")
                     return True
-                except urllib.error.HTTPError as e:
-                    if e.code == 429 or "rate" in str(e).lower():
+                except Exception as e:
+                    msg = str(e).lower()
+                    if "429" in msg or "rate" in msg or "quota" in msg:
                         wait_time = (2 ** attempt) + random.uniform(0, 2)
                         self.log_status(f"[Rate Limited] {filename}: Retrying in {wait_time:.1f}s...")
                         time.sleep(wait_time)
                         attempt += 1
                     else:
-                        self.log_status(f"[HTTPError] {filename}: {e}")
+                        self.log_status(f"[Download Failed] {filename}: {e}")
                         return False
-                except Exception as e:
-                    self.log_status(f"[Download Failed] {filename}: {e}")
-                    return False
             self.log_status(f"[Max Retries Exceeded] {filename}")
             return False
 
@@ -273,20 +281,7 @@ class LandApp:
             current = datetime.strptime(start_date, "%Y-%m-%d")
             end = datetime.strptime(end_date, "%Y-%m-%d")
 
-            total_tiles = x_tiles * y_tiles
-            total_months = 0
-
-            tmp = datetime.strptime(start_date, "%Y-%m-%d")
-            while tmp <= end:
-                total_months += 1
-                tmp = (tmp.replace(day=28) + timedelta(days=4)).replace(day=1)
-
-            total_downloads = total_tiles * total_months
-            current_download = 0
-
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                futures = []
-
+            with ThreadPoolExecutor(max_workers=8) as executor:
                 while current.year <= end.year:
                     year_start = datetime(current.year, 1, 1)
                     year_end = datetime(current.year + 1, 1, 1)
@@ -305,50 +300,65 @@ class LandApp:
                         [1, 2, 3, 4, 5, 6, 7, 8, 9]
                     ).rename('lc')
 
-                    for i in range(x_tiles):
-                        for j in range(y_tiles):
-                            tile_geom = ee.Geometry.Rectangle([
-                                minx + i * tile_deg, miny + j * tile_deg,
-                                min(minx + (i + 1) * tile_deg, maxx),
-                                min(miny + (j + 1) * tile_deg, maxy)
-                            ])
+                    tile_list = ee.List.sequence(0, x_tiles - 1).map(lambda i:
+                                                                     ee.List.sequence(0, y_tiles - 1).map(lambda j:
+                                                                                                          ee.Dictionary(
+                                                                                                              {'i': i,
+                                                                                                               'j': j})
+                                                                                                          )
+                                                                     ).flatten()
 
-                            filename = f"land_cover_{country.replace(' ', '_')}_{label}_tile_{i}_{j}.tif"
-                            path = os.path.join(output_folder, filename)
+                    def check_tile(tile):
+                        tile = ee.Dictionary(tile)
+                        i = ee.Number(tile.get('i'))
+                        j = ee.Number(tile.get('j'))
 
-                            try:
-                                clipped = image.clip(tile_geom)
+                        xmin = ee.Number(minx).add(i.multiply(tile_deg))
+                        ymin = ee.Number(miny).add(j.multiply(tile_deg))
+                        xmax = xmin.add(tile_deg)
+                        ymax = ymin.add(tile_deg)
 
-                                band_names = clipped.bandNames().getInfo()
-                                if not band_names:
-                                    self.log_status(f"[Skipped] {filename}: No valid bands in this tile.")
-                                    continue
+                        tile_geom = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
+                        tile_image = image.clip(tile_geom)
+                        band_count = tile_image.bandNames().size()
+                        intersect_area = roi.intersection(tile_geom, ee.ErrorMargin(1)).area()
 
-                                intersection = roi.intersection(tile_geom, ee.ErrorMargin(1))
-                                area = intersection.area().getInfo()
-                                if area < 1000:
-                                    self.log_status(f"[Skipped] {filename}: Negligible intersection with ROI.")
-                                    continue
+                        return ee.Algorithms.If(
+                            band_count.gt(0).And(intersect_area.gt(1000)),
+                            tile.set('xmin', xmin).set('ymin', ymin).set('i', i).set('j', j),
+                            None
+                        )
 
-                                url = clipped.getDownloadURL({
-                                    'region': tile_geom,
-                                    'scale': scale,
-                                    'format': 'GeoTIFF'
-                                })
+                    all_tiles = tile_list.map(check_tile)
+                    valid_tiles = all_tiles.removeAll([None])
+                    valid_tile_data = valid_tiles.getInfo()
 
-                                self.log_status(f"Queueing download: {filename}")
-                                futures.append(executor.submit(download_tile, url, path, filename))
+                    total_downloads = len(valid_tile_data)
+                    current_download = 0
+                    futures = []
 
-                            except Exception as e:
-                                self.log_status(f"[Tile Prep Failed] {filename}: {e}")
+                    for tile in valid_tile_data:
+                        i = tile['i']
+                        j = tile['j']
+                        xmin = tile['xmin']
+                        ymin = tile['ymin']
+                        xmax = xmin + tile_deg
+                        ymax = ymin + tile_deg
+
+                        tile_geom = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
+                        filename = f"land_cover_{country.replace(' ', '_')}_{label}_tile_{i}_{j}.tif"
+                        path = os.path.join(output_folder, filename)
+
+                        self.log_status(f"Queueing download: {filename}")
+                        futures.append(executor.submit(download_tile, image, tile_geom, path, filename))
+
+                    for f in as_completed(futures):
+                        _ = f.result()
+                        current_download += 1
+                        self.progress_bar['value'] = (current_download / total_downloads) * 100
+                        self.progress_bar.update_idletasks()
 
                     current = datetime(current.year + 1, 1, 1)
-
-                for f in as_completed(futures):
-                    _ = f.result()
-                    current_download += 1
-                    self.progress_bar['value'] = (current_download / total_downloads) * 100
-                    self.progress_bar.update_idletasks()
 
             self.log_status("Tiled local export complete.")
             self.progress_bar['value'] = 100

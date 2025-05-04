@@ -54,11 +54,21 @@ def process_folder(folder_path):
 
     for filename in os.listdir(folder_path):
         if filename.lower().endswith((".tif", ".tiff", ".png")):
-            match = re.search(r'(\d{4})', filename)
-            if not match:
+            matches = re.findall(r'(20\d{2})', filename)
+            year = None
+            for m in matches:
+                y = int(m)
+                if 2017 <= y <= 2025:
+                    year = y
+                    break
+
+            if not year:
+                print(f"[Skipped] No valid year found in: {filename}")
                 continue
-            year = int(match.group(1))
+
             date_label = datetime(year, 1, 1)
+
+            print(f"Processing file: {filename} -> {date_label}")
             image_path = os.path.join(folder_path, filename)
             record = process_image(image_path, date_label)
             grouped[date_label].append(record)
