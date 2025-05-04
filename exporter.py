@@ -15,9 +15,9 @@ def export_image_to_drive(image, region, filename_prefix, folder='EarthEngineExp
     task.start()
     return task
 
-def export_monthly_landcover(country_name, start_date_str, end_date_str, project_id='final-project-jpp317487'):
+def export_yearly_landcover(country_name, start_date_str, end_date_str, project_id='final-project-jpp317487'):
     """
-    Batch export of land cover images per month to Google Drive.
+    Batch export of land cover images per year to Google Drive.
     Date format: YYYY-MM-DD
     """
     ee.Initialize(project=project_id)
@@ -33,25 +33,26 @@ def export_monthly_landcover(country_name, start_date_str, end_date_str, project
 
     current = start
     tasks = []
-    while current <= end:
-        next_month = (current.replace(day=28) + timedelta(days=4)).replace(day=1)
-        month_str = current.strftime("%Y-%m")
+    while current.year <= end.year:
+        year_start = datetime(current.year, 1, 1)
+        year_end = datetime(current.year + 1, 1, 1)
+        label = str(current.year)
 
         collection = ee.ImageCollection('projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m_TS') \
-            .filterDate(current.strftime("%Y-%m-%d"), next_month.strftime("%Y-%m-%d"))
+            .filterDate(year_start.strftime("%Y-%m-%d"), year_end.strftime("%Y-%m-%d"))
 
         if collection.size().getInfo() == 0:
-            print(f"[Skipped] No landcover data for {month_str}")
+            print(f"[Skipped] No landcover data for {year_start}")
         else:
             lc = collection.mosaic() \
                 .remap([1, 2, 3, 5, 7, 8, 9, 10, 11], [1, 2, 3, 4, 5, 6, 7, 8, 9]) \
                 .rename('lc')
 
-            filename = f"land_cover_{country_name.replace(' ', '_')}_{month_str}"
+            filename = f"land_cover_{country_name.replace(' ', '_')}_{year_start}"
             task = export_image_to_drive(lc, roi.geometry(), filename, folder=export_folder)
-            tasks.append((month_str, task.id))
+            tasks.append((year_start, task.id))
 
-        current = next_month
+        current = datetime(current.year + 1, 1, 1)
 
     print(f"Started {len(tasks)} export tasks in folder '{export_folder}'.")
     return tasks

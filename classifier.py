@@ -19,14 +19,13 @@ except Exception as e:
     ee.Initialize(project='final-project-jpp317487')
 
 class ClassificationApp:
-    def __init__(self, control_frame, display_frame, log_callback=None):
+    def __init__(self, control_frame, display_frame, log_callback=None, progress_callback=None):
         self.control_frame = control_frame
         self.display_frame = display_frame
         self.log = log_callback if log_callback else print
+        self.set_progress = progress_callback or (lambda x: None)
         self.map = geemap.Map()
         self.temp_html = tempfile.mktemp(suffix=".html")
-
-        self.progress = None  # Will be initialized in controls
 
         self._setup_controls()
         self._setup_map()
@@ -34,7 +33,7 @@ class ClassificationApp:
     def _setup_controls(self):
         ttk.Label(self.control_frame, text="Land Classification", font=("Helvetica", 16, "bold")).pack(pady=10)
 
-        # Country selector
+        # Country dropdown
         ttk.Label(self.control_frame, text="Country").pack()
         self.country_var = tk.StringVar()
         self.country_dropdown = ttk.Combobox(self.control_frame, textvariable=self.country_var, state="readonly")
@@ -42,40 +41,27 @@ class ClassificationApp:
         self.country_dropdown.set("United Kingdom")
         self.country_dropdown.pack(pady=5)
 
-        # Time range options
-        self.range_options = {
-            "1 Quarter": 3,
-            "Half Year": 6,
-            "1 Year": 12,
-            "2 Years": 24,
-            "5 Years": 60
-        }
-        ttk.Label(self.control_frame, text="Time Range").pack()
-        self.range_var = tk.StringVar()
-        self.range_dropdown = ttk.Combobox(self.control_frame, textvariable=self.range_var, state="readonly")
-        self.range_dropdown['values'] = list(self.range_options.keys())
-        self.range_dropdown.set("1 Year")
-        self.range_dropdown.pack(pady=(0, 5))
+        # Start and End Year dropdowns
+        ttk.Label(self.control_frame, text="Start Year").pack()
+        self.start_year_var = tk.StringVar()
+        self.start_year_dropdown = ttk.Combobox(self.control_frame, textvariable=self.start_year_var, state="readonly")
+        self.start_year_dropdown.pack()
 
-        ttk.Button(self.control_frame, text="Set Date Range", command=self._update_date_range).pack(pady=5)
+        ttk.Label(self.control_frame, text="End Year").pack()
+        self.end_year_var = tk.StringVar()
+        self.end_year_dropdown = ttk.Combobox(self.control_frame, textvariable=self.end_year_var, state="readonly")
+        self.end_year_dropdown.pack()
 
-        # Start/end dates
-        ttk.Label(self.control_frame, text="Start Date (YYYY-MM-DD)").pack()
-        self.start_date = ttk.Entry(self.control_frame)
-        self.start_date.insert(0, "2023-01-01")
-        self.start_date.pack()
+        # Populate year ranges based on dataset availability
+        self.valid_years = list(range(2017, 2024))  # ESRI dataset: 2017 to 2023
+        self.start_year_dropdown['values'] = self.valid_years[:-2]  # At least 2 years range
+        self.start_year_var.set(str(self.valid_years[-3]))
+        self._update_end_years()
 
-        ttk.Label(self.control_frame, text="End Date (YYYY-MM-DD)").pack()
-        self.end_date = ttk.Entry(self.control_frame)
-        self.end_date.insert(0, "2023-12-31")
-        self.end_date.pack()
+        self.start_year_dropdown.bind("<<ComboboxSelected>>", lambda e: self._update_end_years())
 
-        # Buttons
+        # Classification button
         ttk.Button(self.control_frame, text="Run Classification", command=self.run_classification).pack(pady=10)
-
-        self.progress = ttk.Progressbar(self.control_frame, orient="horizontal", length=250, mode="determinate")
-        self.progress.pack(pady=(5, 15))
-        self.progress['value'] = 0
 
     def _get_country_names(self):
         try:
@@ -97,6 +83,13 @@ class ClassificationApp:
         self.end_date.insert(0, end.strftime("%Y-%m-%d"))
         self.log(f"Date range set: {start} to {end}")
 
+    def _update_end_years(self):
+        start = int(self.start_year_var.get())
+        allowed_ends = [y for y in self.valid_years if y > start]
+        self.end_year_dropdown['values'] = allowed_ends
+        if allowed_ends:
+            self.end_year_var.set(str(allowed_ends[-1]))
+
     def _setup_map(self):
         self.html_view = HtmlFrame(self.display_frame)
         self.html_view.pack(fill='both', expand=True)
@@ -104,69 +97,80 @@ class ClassificationApp:
     def run_classification(self):
         threading.Thread(target=self._run_task, daemon=True).start()
 
+    def _set_progress(self, value):
+        if self.progress_bar:
+            def update():
+                self.set_progress(value)
+            self.progress_bar.after(0, update)
+
     def _run_task(self):
         try:
-            self.progress['value'] = 0
-            self.log("Starting classification...")
-            country = self.country_var.get()
-            start_date = self.start_date.get()
-            end_date = self.end_date.get()
+            self.log("Starting yearly classification...")
 
-            self.log(f"Filtering region: {country}")
+            country = self.country_var.get()
+            start_year = int(self.start_year_var.get())
+            end_year = int(self.end_year_var.get())
+
             countries = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
             roi = countries.filter(ee.Filter.eq("country_na", country))
-            if self.map.layers:
-                self.map.layers = [self.map.layers[0]]
+            self.map.layers = [self.map.layers[0]]
             self.map.addLayer(roi, {}, "Border")
-            self.progress['value'] = 20
 
-            self.log(f"Filtering image collection for {start_date} to {end_date}")
-            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            # Pick appropriate dataset per year
+            def select_landsat_collection(year):
+                if year < 2013:
+                    return 'LANDSAT/LE07/C02/T1_L2'
+                elif year < 2021:
+                    return 'LANDSAT/LC08/C02/T1_L2'
+                else:
+                    return 'LANDSAT/LC09/C02/T1_L2'
 
-            if start_dt.year < 2013:
-                landsat_collection = 'LANDSAT/LE07/C02/T1_L2'  # Landsat 7
-            elif start_dt.year < 2021:
-                landsat_collection = 'LANDSAT/LC08/C02/T1_L2'  # Landsat 8
-            else:
-                landsat_collection = 'LANDSAT/LC09/C02/T1_L2'  # Landsat 9
+            for idx, year in enumerate(range(start_year, end_year + 1)):
+                self.log(f"Processing {year}...")
+                progress_value = ((idx + 1) / (end_year - start_year + 1)) * 100
+                self.set_progress(progress_value)
 
-            self.log(f"Using dataset: {landsat_collection}")
+                start_date = f"{year}-01-01"
+                end_date = f"{year}-12-31"
+                dataset = select_landsat_collection(year)
 
-            image = ee.ImageCollection(landsat_collection) \
-                .filterDate(start_date, end_date) \
-                .filterBounds(roi)
+                collection = ee.ImageCollection(dataset) \
+                    .filterDate(start_date, end_date) \
+                    .filterBounds(roi)
 
-            if image.size().getInfo() == 0:
-                raise Exception("No imagery found for the selected date range and region.")
+                if collection.size().getInfo() == 0:
+                    self.log(f"[Skipped] No imagery for {year}")
+                    continue
 
-            image = image.median()
+                image = collection.median()
+                vis = {'bands': ['SR_B4', 'SR_B3', 'SR_B2'], 'min': 0, 'max': 0.3}
+                self.map.addLayer(image, vis, f'Landsat RGB {year}')
 
-            vis = {'bands': ['SR_B4', 'SR_B3', 'SR_B2'], 'min': 0, 'max': 0.3}
-            self.map.addLayer(image, vis, 'Landsat RGB')
+                # Optional: Add land cover layer if available
+                lc_collection = ee.ImageCollection('projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m_TS') \
+                    .filterDate(start_date, end_date)
+
+                if lc_collection.size().getInfo() > 0:
+                    lc = lc_collection.mosaic().remap(
+                        [1, 2, 3, 5, 7, 8, 9, 10, 11],
+                        [1, 2, 3, 4, 5, 6, 7, 8, 9]
+                    ).rename('lc')
+                    self.map.addLayer(lc.clip(roi.geometry()), {
+                        'min': 1, 'max': 9, 'palette': [
+                            "#1A5BAB", "#358221", "#87D19E", "#FFDB5C",
+                            "#ED022A", "#EDE9E4", "#F2FAFF", "#C8C8C8", "#C6AD9D"
+                        ]
+                    }, f"Land Cover {year}")
+
+                progress_value = ((idx + 1) / (end_year - start_year + 1)) * 100
+                self.set_progress(progress_value)
+
             self.map.centerObject(roi, 6)
-            self.progress['value'] = 50
-
-            self.log("Loading land cover dataset...")
-            lc = ee.ImageCollection('projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m_TS') \
-                .filterDate(start_date, end_date) \
-                .mosaic() \
-                .remap([1, 2, 3, 5, 7, 8, 9, 10, 11], [1, 2, 3, 4, 5, 6, 7, 8, 9]) \
-                .rename('lc')
-            land_cover = lc.clip(roi.geometry())
-            self.map.addLayer(land_cover,
-                              {'min': 1, 'max': 9, 'palette': ["#1A5BAB", "#358221", "#87D19E", "#FFDB5C",
-                                                              "#ED022A", "#EDE9E4", "#F2FAFF", "#C8C8C8",
-                                                              "#C6AD9D"]},
-                              'Land Cover')
-            self.progress['value'] = 80
-
-            self.log("Rendering map...")
             self.map.save(self.temp_html)
             self.html_view.load_html(self.temp_html)
-            self.progress['value'] = 100
-            self.log("Classification complete.")
+            self.log("Yearly classification complete.")
 
         except Exception as e:
-            self.progress['value'] = 0
+            self.set_progress(0)
             messagebox.showerror("Classification Error", str(e))
             self.log(f"[ERROR] {e}")

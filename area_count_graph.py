@@ -29,67 +29,67 @@ import sys
 print(sys.executable)
 
 def process_image(image_path, date_label):
-    """Reads a single-band GeoTIFF or PNG and counts pixel areas per class."""
     ext = os.path.splitext(image_path)[1].lower()
 
     if ext in [".tif", ".tiff"]:
         with rasterio.open(image_path) as src:
-            img_array = src.read(1)  # Read first band
+            img_array = src.read(1)
     else:
         img = Image.open(image_path)
         img_array = np.array(img)
 
-    counts = {}
-    for class_value, class_name in CLASS_MAPPING.items():
-        pixel_count = np.sum(img_array == class_value)
-        area_sqm = pixel_count * PIXEL_SIZE_SQ_M
-        area_sqkm = area_sqm / 1e6
-        counts[class_name] = area_sqkm
+    # Forest class is 2
+    forest_pixel_count = np.sum(img_array == 2)
+    area_sqm = forest_pixel_count * PIXEL_SIZE_SQ_M
+    area_sqkm = area_sqm / 1e6
 
-    counts['Date'] = date_label
-    return counts
+    return {'Date': date_label, 'Forest': area_sqkm}
 
 
 def process_folder(folder_path):
-    """Processes all images in a folder, including Earth Engine-tiled GeoTIFFs."""
-    grouped_records = defaultdict(list)
+    from collections import defaultdict
+    import re
+
+    grouped = defaultdict(list)
 
     for filename in os.listdir(folder_path):
-        if filename.lower().endswith((".png", ".tif", ".tiff")):
-            try:
-                # Match YYYY-MM pattern from filename
-                match = re.search(r'(\d{4}-\d{2})', filename)
-                if not match:
-                    raise ValueError("No date pattern found in filename")
+        if filename.lower().endswith((".tif", ".tiff", ".png")):
+            match = re.search(r'(\d{4})', filename)
+            if not match:
+                continue
+            year = int(match.group(1))
+            date_label = datetime(year, 1, 1)
+            image_path = os.path.join(folder_path, filename)
+            record = process_image(image_path, date_label)
+            grouped[date_label].append(record)
 
-                date_str = match.group(1)
-                date_label = datetime.strptime(date_str, "%Y-%m")
-                image_path = os.path.join(folder_path, filename)
-                record = process_image(image_path, date_label)
-                grouped_records[date_label].append(record)
-
-            except Exception as e:
-                print(f"[Warning] Skipping file {filename}: {e}")
-
-    if not grouped_records:
-        raise ValueError("No valid image records found in folder.")
-
-    # Merge tiles per date
+    # Aggregate all forest areas per year
     merged = []
-    for date_label, records in grouped_records.items():
-        merged_record = {'Date': date_label}
-        for class_name in CLASS_MAPPING.values():
-            merged_record[class_name] = sum(r.get(class_name, 0) for r in records)
-        merged.append(merged_record)
+    for date_label, records in grouped.items():
+        total_forest = sum(r['Forest'] for r in records)
+        merged.append({'Date': date_label, 'Forest': total_forest})
 
     df = pd.DataFrame(merged)
     df = df.sort_values('Date')
     return df
 
+def generate_graph(df, forest_only=False):
+    if forest_only:
+        return plot_forest_graph(df)
+    else:
+        return plot_area(df)
 
+def plot_forest_graph(df):
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(df['Date'], df['Forest'], marker='o', label='Forest Cover (sq.km)')
+    ax.set_xlabel('Year')
+    ax.set_ylabel('Forest Area (sq.km)')
+    ax.set_title('Forest Cover Over Time')
+    ax.legend()
+    ax.grid(True)
+    return fig
 
 def plot_area(df, time_group='month', save_path=None):
-    """Plots area bar graphs over time, optionally saves the graph as an image."""
     df_plot = df.copy()
 
     if time_group == 'year':
