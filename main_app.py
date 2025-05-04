@@ -224,14 +224,36 @@ class LandApp:
     def _local_export_thread(self):
         self.status_text.delete("1.0", tk.END)
         country = self.classifier.country_var.get()
-        start_date = self.classifier.start_date.get()
-        end_date = self.classifier.end_date.get()
+        start_date = f"{self.classifier.start_year_var.get()}-01-01"
+        end_date = f"{self.classifier.end_year_var.get()}-12-31"
         output_folder = self.output_folder_entry.get()
         tile_deg = self.tile_size_deg
         scale = self.default_scale
         self.progress_bar['value'] = 0
         self.progress_bar.update_idletasks()
         os.makedirs(output_folder, exist_ok=True)
+
+        def download_tile(url, path, filename, max_retries=5):
+            attempt = 0
+            while attempt < max_retries:
+                try:
+                    urllib.request.urlretrieve(url, path)
+                    self.log_status(f"Saved: {path}")
+                    return True
+                except urllib.error.HTTPError as e:
+                    if e.code == 429 or "rate" in str(e).lower():
+                        wait_time = (2 ** attempt) + random.uniform(0, 2)
+                        self.log_status(f"[Rate Limited] {filename}: Retrying in {wait_time:.1f}s...")
+                        time.sleep(wait_time)
+                        attempt += 1
+                    else:
+                        self.log_status(f"[HTTPError] {filename}: {e}")
+                        return False
+                except Exception as e:
+                    self.log_status(f"[Download Failed] {filename}: {e}")
+                    return False
+            self.log_status(f"[Max Retries Exceeded] {filename}")
+            return False
 
         self.log_status(f"Starting tiled local export to: {output_folder}")
         try:
@@ -262,72 +284,79 @@ class LandApp:
             total_downloads = total_tiles * total_months
             current_download = 0
 
-            while current.year <= end.year:
-                year_start = datetime(current.year, 1, 1)
-                year_end = datetime(current.year + 1, 1, 1)
-                label = f"{current.year}"
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                futures = []
 
-                collection = ee.ImageCollection(...).filterDate(year_start.strftime("%Y-%m-%d"), year_end.strftime("%Y-%m-%d"))
+                while current.year <= end.year:
+                    year_start = datetime(current.year, 1, 1)
+                    year_end = datetime(current.year + 1, 1, 1)
+                    label = f"{current.year}"
 
-                if collection.size().getInfo() == 0:
-                    self.log_status(f"[Skipped] No data for {label}")
+                    collection = ee.ImageCollection('projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m_TS') \
+                        .filterDate(year_start.strftime("%Y-%m-%d"), year_end.strftime("%Y-%m-%d"))
+
+                    if collection.size().getInfo() == 0:
+                        self.log_status(f"[Skipped] No data for {label}")
+                        current = datetime(current.year + 1, 1, 1)
+                        continue
+
+                    image = collection.mosaic().remap(
+                        [1, 2, 3, 5, 7, 8, 9, 10, 11],
+                        [1, 2, 3, 4, 5, 6, 7, 8, 9]
+                    ).rename('lc')
+
+                    for i in range(x_tiles):
+                        for j in range(y_tiles):
+                            tile_geom = ee.Geometry.Rectangle([
+                                minx + i * tile_deg, miny + j * tile_deg,
+                                min(minx + (i + 1) * tile_deg, maxx),
+                                min(miny + (j + 1) * tile_deg, maxy)
+                            ])
+
+                            filename = f"land_cover_{country.replace(' ', '_')}_{label}_tile_{i}_{j}.tif"
+                            path = os.path.join(output_folder, filename)
+
+                            try:
+                                clipped = image.clip(tile_geom)
+
+                                band_names = clipped.bandNames().getInfo()
+                                if not band_names:
+                                    self.log_status(f"[Skipped] {filename}: No valid bands in this tile.")
+                                    continue
+
+                                intersection = roi.intersection(tile_geom, ee.ErrorMargin(1))
+                                area = intersection.area().getInfo()
+                                if area < 1000:
+                                    self.log_status(f"[Skipped] {filename}: Negligible intersection with ROI.")
+                                    continue
+
+                                url = clipped.getDownloadURL({
+                                    'region': tile_geom,
+                                    'scale': scale,
+                                    'format': 'GeoTIFF'
+                                })
+
+                                self.log_status(f"Queueing download: {filename}")
+                                futures.append(executor.submit(download_tile, url, path, filename))
+
+                            except Exception as e:
+                                self.log_status(f"[Tile Prep Failed] {filename}: {e}")
+
                     current = datetime(current.year + 1, 1, 1)
-                    continue
 
-                image = collection.mosaic().remap(
-                    [1, 2, 3, 5, 7, 8, 9, 10, 11],
-                    [1, 2, 3, 4, 5, 6, 7, 8, 9]
-                ).rename('lc')
-
-                for i in range(x_tiles):
-                    for j in range(y_tiles):
-                        tile_geom = ee.Geometry.Rectangle([minx + i * tile_deg, miny + j * tile_deg,
-                                                           min(minx + (i + 1) * tile_deg, maxx),
-                                                           min(miny + (j + 1) * tile_deg, maxy)])
-
-                        filename = f"land_cover_{country.replace(' ', '_')}_{label}_tile_{i}_{j}.tif"
-                        path = os.path.join(output_folder, filename)
-
-                        try:
-                            # Clip image to tile
-                            clipped = image.clip(tile_geom)
-
-                            # Check that it has non-empty bands before attempting export
-                            band_names = clipped.bandNames().getInfo()
-                            if not band_names:
-                                self.log_status(f"[Skipped] {filename}: No valid bands in this tile.")
-                                continue
-
-                            intersection = roi.intersection(tile_geom, ee.ErrorMargin(1))
-                            area = intersection.area().getInfo()
-                            if area < 1000:  # Less than 1000 m² = skip
-                                self.log_status(f"[Skipped] {filename}: Negligible intersection with ROI.")
-                                continue
-
-                            url = clipped.getDownloadURL({
-                                'region': tile_geom,
-                                'scale': scale,
-                                'format': 'GeoTIFF'
-                            })
-
-                            self.log_status(f"Downloading {filename}...")
-                            urllib.request.urlretrieve(url, path)
-                            self.log_status(f"Saved: {path}")
-                        except Exception as e:
-                            self.log_status(f"[Tile Failed] {filename}: {e}")
-
-                        current_download += 1
-                        self.progress_bar['value'] = (current_download / total_downloads) * 100
-                        self.progress_bar.update_idletasks()
-                current = datetime(current.year + 1, 1, 1)
+                for f in as_completed(futures):
+                    _ = f.result()
+                    current_download += 1
+                    self.progress_bar['value'] = (current_download / total_downloads) * 100
+                    self.progress_bar.update_idletasks()
 
             self.log_status("Tiled local export complete.")
             self.progress_bar['value'] = 100
             self.progress_bar.update_idletasks()
+
         except Exception as e:
             self.log_status(f"[ERROR] {e}")
             messagebox.showerror("Export Error", str(e))
-
 
 if __name__ == "__main__":
     root = tk.Tk()
