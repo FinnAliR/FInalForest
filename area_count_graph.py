@@ -5,28 +5,17 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from datetime import datetime
 import rasterio
-import re
-from collections import defaultdict
 
 # Configuration
 PIXEL_SIZE_SQ_M = 100  # Example: 10m x 10m resolution = 100 square meters per pixel
 CLASS_MAPPING = {
-    1: 'Water',
     2: 'Trees',
-    3: 'Flooded Vegetation',
-    4: 'Crops',
-    5: 'Developed land',
-    6: 'Barren land',
-    7: 'Snow and ice',
-    8: 'Clouds',
-    9: 'Rangeland'
 }
 
 
 # ------------- FUNCTIONS ----------------
 
 import sys
-print(sys.executable)
 
 def process_image(image_path, date_label):
     ext = os.path.splitext(image_path)[1].lower()
@@ -46,32 +35,31 @@ def process_image(image_path, date_label):
     return {'Date': date_label, 'Forest': area_sqkm}
 
 
-def process_folder(folder_path):
+def process_folder(folder_path, progress_callback=None):
     from collections import defaultdict
     import re
 
     grouped = defaultdict(list)
+    files = [f for f in os.listdir(folder_path) if f.lower().endswith((".tif", ".tiff", ".png"))]
+    total_files = len(files)
 
-    for filename in os.listdir(folder_path):
-        if filename.lower().endswith((".tif", ".tiff", ".png")):
-            matches = re.findall(r'(20\d{2})', filename)
-            year = None
-            for m in matches:
-                y = int(m)
-                if 2017 <= y <= 2025:
-                    year = y
-                    break
-
-            if not year:
-                print(f"[Skipped] No valid year found in: {filename}")
-                continue
-
-            date_label = datetime(year, 1, 1)
-
-            print(f"Processing file: {filename} -> {date_label}")
-            image_path = os.path.join(folder_path, filename)
-            record = process_image(image_path, date_label)
-            grouped[date_label].append(record)
+    for idx, filename in enumerate(files):
+        matches = re.findall(r'(20\d{2})', filename)
+        year = None
+        for m in matches:
+            y = int(m)
+            if 2017 <= y <= 2025:
+                year = y
+                break
+        if not year:
+            print(f"[Skipped] No valid year found in: {filename}")
+            continue
+        date_label = datetime(year, 1, 1)
+        image_path = os.path.join(folder_path, filename)
+        record = process_image(image_path, date_label)
+        grouped[date_label].append(record)
+        if progress_callback:
+            progress_callback((idx + 1) / total_files * 50)  # scale to 0-50%
 
     # Aggregate all forest areas per year
     merged = []
@@ -83,11 +71,8 @@ def process_folder(folder_path):
     df = df.sort_values('Date')
     return df
 
-def generate_graph(df, forest_only=False):
-    if forest_only:
-        return plot_forest_graph(df)
-    else:
-        return plot_area(df)
+def generate_graph(df):
+    return plot_forest_graph(df)
 
 def plot_forest_graph(df):
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -98,40 +83,10 @@ def plot_forest_graph(df):
     ax.legend()
     ax.grid(True)
     return fig
-
-def plot_area(df, time_group='month', save_path=None):
-    df_plot = df.copy()
-
-    if time_group == 'year':
-        df_plot['Year'] = df_plot['Date'].dt.year
-        group = df_plot.groupby('Year').sum()
-    elif time_group == 'month':
-        df_plot['Month'] = df_plot['Date'].dt.to_period('M')
-        group = df_plot.groupby('Month').sum()
-    else:
-        raise ValueError("time_group must be 'month' or 'year'")
-
-    group.drop(columns=['Date'], errors='ignore', inplace=True)
-
-    # Plotting
-    ax = group.plot(kind='bar', stacked=True, figsize=(14, 8))
-    plt.ylabel('Area (sq km)')
-    plt.title(f'Land Cover Area over Time (by {time_group})')
-    plt.legend(title='Land Cover Class')
-    plt.grid(axis='y')
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path)
-        print(f"Graph saved to {save_path}")
-
-    plt.show()
-
-
 # ------------- MAIN USAGE ----------------
 
 if __name__ == "__main__":
-    # Example: Folder containing classified maps (e.g., '2023-01.png', '2023-02.png', ...)
+    #Folder containing maps
     folder = "./classified_maps"
 
     # Process all images
@@ -139,9 +94,3 @@ if __name__ == "__main__":
 
     # Optional: Save to CSV
     df_areas.to_csv("land_cover_areas.csv", index=False)
-
-    # Plot by month and save
-    plot_area(df_areas, time_group='month', save_path="land_cover_area_graph.png")
-
-    # Plot by year (alternative)
-    # plot_area(df_areas, time_group='year', save_path="land_cover_area_yearly.png")

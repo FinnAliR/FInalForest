@@ -1,15 +1,11 @@
 import tkinter as tk
-import urllib
 from datetime import date, datetime, timedelta
 from tkinter import ttk, messagebox
 from dateutil.relativedelta import relativedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import urllib.error
-import random
-import requests
 from classifier import ClassificationApp
 from graph_creator import GraphCreator
-from exporter import export_yearly_landcover
+from ndvi_test import run_ndvi_analysis
+from exporter import export_local_yearly_landcover, export_yearly_landcover
 import threading
 import ee
 import time
@@ -31,8 +27,15 @@ class LandApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Land Cover Classification")
-        self.root.geometry("1300x900")
+        self.root.title("LCCT: Land Cover Classification Tool")
+        self.root.geometry("1300x1000")
+        # Initialize Earth Engine
+        try:
+            ee.Initialize(project='final-project-jpp317487')
+        except Exception:
+            ee.Authenticate()
+            ee.Initialize(project='final-project-jpp317487')
+        self.auto_refresh_var = tk.BooleanVar(value=False)
 
         # Top container for main UI
         self.top_container = ttk.Frame(root)
@@ -67,12 +70,23 @@ class LandApp:
             log_callback=self.log_status,
             progress_callback=lambda v: self.progress_bar.config(value=v)
         )
-        self.graph_viewer = GraphCreator(self.left_panel, self.right_panel, self.log_status, self.progress_bar)
+        ttk.Button(self.left_panel, text="Independent NDVI Check", command=self.run_ndvi_analysis).pack(pady=(10, 5))
 
+        self.cancel_event = threading.Event()
         self._setup_batch_export_controls()
 
-        self.tile_size_deg = 0.2
+        self.tile_size_deg = 0.4
         self.default_scale = 10
+
+        self.graph_viewer = GraphCreator(self.left_panel, self.right_panel, self.log_status, self.progress_bar)
+        self.graph_viewer.classifier = self.classifier
+
+    def choose_export_folder(self):
+        folder = tk.filedialog.askdirectory()
+        if folder:
+            self.output_folder = folder
+            self.folder_label.config(text=f"Folder: {os.path.basename(folder)}")
+            self.log_status(f"Export folder set to: {folder}")
 
     def _setup_batch_export_controls(self):
         ttk.Label(self.left_panel, text="\nBatch Export", font=("Helvetica", 14, "bold")).pack(pady=10)
@@ -83,27 +97,26 @@ class LandApp:
         # --- Tab 1: Google Drive ---
         self.tab_drive = ttk.Frame(notebook)
         notebook.add(self.tab_drive, text="Export to Drive")
-
-        self.auto_refresh_var = tk.BooleanVar()
-        ttk.Checkbutton(self.tab_drive, text="Auto-refresh graph when done", variable=self.auto_refresh_var).pack(
-            pady=5)
-        ttk.Button(self.tab_drive, text="Export Monthly Images to Drive", command=self.run_batch_export).pack(pady=5)
+        ttk.Button(self.tab_drive, text="Export Images to Drive", command=self.run_batch_export).pack(pady=5)
 
         # --- Tab 2: Local Export ---
         self.tab_local = ttk.Frame(notebook)
         notebook.add(self.tab_local, text="Export to Local")
+        self.output_folder = "./classified_exports"
+        ttk.Button(self.tab_local, text="Choose Export Folder", command=self.choose_export_folder).pack(pady=5)
 
-        ttk.Label(self.tab_local, text="Output Folder").pack()
-        self.output_folder_entry = ttk.Entry(self.tab_local, width=30)
-        self.output_folder_entry.insert(0, "./classified_exports")
-        self.output_folder_entry.pack(pady=5)
+        self.folder_label = ttk.Label(self.tab_local, text=f"Folder: {os.path.basename(self.output_folder)}", wraplength=280)
+        self.folder_label.pack(pady=2)
         ttk.Button(self.tab_local, text="Set Export Options", command=self._show_export_options).pack(pady=5)
         ttk.Button(self.tab_local, text="Export Locally", command=self.run_local_export).pack(pady=5)
+        ttk.Button(self.tab_local, text="Cancel Export", command=self.cancel_export).pack(side=tk.LEFT, padx=5)
 
     def _show_export_options(self):
         win = tk.Toplevel(self.root)
         win.title("Export Options")
         win.geometry("300x180")
+
+        ttk.Checkbutton(self.tab_drive, text="Auto-refresh graph when done", variable=self.auto_refresh_var).pack(pady=5)
 
         ttk.Label(win, text="Tile Size (degrees):").pack(pady=5)
         tile_entry = ttk.Entry(win)
@@ -114,6 +127,7 @@ class LandApp:
         scale_entry = ttk.Entry(win)
         scale_entry.insert(0, str(self.default_scale))
         scale_entry.pack()
+
 
         def save_settings():
             try:
@@ -128,6 +142,10 @@ class LandApp:
         ttk.Button(win, text="Reset Defaults",
                    command=lambda: [tile_entry.delete(0, tk.END), tile_entry.insert(0, "0.2"),
                                     scale_entry.delete(0, tk.END), scale_entry.insert(0, "10")]).pack()
+
+    def cancel_export(self):
+        self.cancel_event.set()
+        self.log_status("Local export canceled by user.")
 
     def load_country_list(self):
         try:
@@ -160,16 +178,19 @@ class LandApp:
         threading.Thread(target=self._batch_export_thread, daemon=True).start()
 
     def _batch_export_thread(self):
-        self.status_text.delete("1.0", tk.END)
+        self.status_text.after(0, lambda: self.status_text.delete("1.0", tk.END))
         country = self.classifier.country_var.get()
+        self.status_text.after(0, lambda: self.log_status("Starting export to Drive..."))
         start = f"{self.classifier.start_year_var.get()}-01-01"
         end = f"{self.classifier.end_year_var.get()}-12-31"
 
         try:
-            tasks = export_yearly_landcover(country, start, end, project_id='final-project-jpp317487')
-            self.log_status(f"\nStarted {len(tasks)} tasks:")
-            for month, task_id in tasks:
-                self.log_status(f"{month}: {task_id}")
+            tasks = export_yearly_landcover(country, start, end)
+            # Schedule the following logs on the GUI thread:
+            self.status_text.after(0, lambda: self.log_status(f"\nStarted {len(tasks)} tasks:"))
+            for year, i, j, task in tasks:
+                msg = f"{year} tile ({i},{j}): {getattr(task, 'id', task)}"
+                self.status_text.after(0, lambda m=msg: self.log_status(m))
             messagebox.showinfo("Batch Export", "export tasks started. This may take a few minutes.\nLive status will update below.")
             self.progress_bar['value'] = 0
             self.progress_bar.update_idletasks()
@@ -218,155 +239,43 @@ class LandApp:
             self.log_status(f"Error: {str(e)}")
 
     def run_local_export(self):
+        self.cancel_event.clear()
         start = f"{self.classifier.start_year_var.get()}-01-01"
         end = f"{self.classifier.end_year_var.get()}-12-31"
-        threading.Thread(target=self._local_export_thread, daemon=True).start()
+        threading.Thread(
+            target=lambda: export_local_yearly_landcover(
+                country_name=self.classifier.country_var.get(),
+                start_date_str=start,
+                end_date_str=end,
+                output_folder=self.output_folder,
+                tile_size_deg=self.tile_size_deg,
+                scale=self.default_scale,
+                use_custom=self.classifier.use_custom_classifier.get(),  # <-- here
+                log_fn=self.log_status,
+                progress_fn=lambda v: self.progress_bar.config(value=v),
+                cancel_event=self.cancel_event
+            ), daemon=True
+        ).start()
 
-    def _local_export_thread(self):
-        self.status_text.delete("1.0", tk.END)
+    def run_ndvi_analysis(self):
+        # gather parameters
         country = self.classifier.country_var.get()
-        start_date = f"{self.classifier.start_year_var.get()}-01-01"
-        end_date = f"{self.classifier.end_year_var.get()}-12-31"
-        output_folder = self.output_folder_entry.get()
-        tile_deg = self.tile_size_deg
-        scale = self.default_scale
-        self.progress_bar['value'] = 0
-        self.progress_bar.update_idletasks()
-        os.makedirs(output_folder, exist_ok=True)
-
-        def download_tile(image, tile_geom, path, filename, max_retries=5):
-            attempt = 0
-            while attempt < max_retries:
-                try:
-                    url = image.clip(tile_geom).getDownloadURL({
-                        'region': tile_geom,
-                        'scale': scale,
-                        'format': 'GeoTIFF'
-                    })
-                    with requests.get(url, stream=True) as r:
-                        r.raise_for_status()
-                        with open(path, 'wb') as f:
-                            for chunk in r.iter_content(chunk_size=8192):
-                                f.write(chunk)
-                    self.log_status(f"Saved: {path}")
-                    return True
-                except Exception as e:
-                    msg = str(e).lower()
-                    if "429" in msg or "rate" in msg or "quota" in msg:
-                        wait_time = (2 ** attempt) + random.uniform(0, 2)
-                        self.log_status(f"[Rate Limited] {filename}: Retrying in {wait_time:.1f}s...")
-                        time.sleep(wait_time)
-                        attempt += 1
-                    else:
-                        self.log_status(f"[Download Failed] {filename}: {e}")
-                        return False
-            self.log_status(f"[Max Retries Exceeded] {filename}")
-            return False
-
-        self.log_status(f"Starting tiled local export to: {output_folder}")
-        try:
-            ee.Initialize(project='final-project-jpp317487')
-            countries = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
-            roi = countries.filter(ee.Filter.eq("country_na", country)).geometry()
-            bounds = roi.bounds().coordinates().get(0).getInfo()
-
-            lons = [pt[0] for pt in bounds]
-            lats = [pt[1] for pt in bounds]
-            minx, maxx = min(lons), max(lons)
-            miny, maxy = min(lats), max(lats)
-
-            x_tiles = int((maxx - minx) // tile_deg) + 1
-            y_tiles = int((maxy - miny) // tile_deg) + 1
-
-            current = datetime.strptime(start_date, "%Y-%m-%d")
-            end = datetime.strptime(end_date, "%Y-%m-%d")
-
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                while current.year <= end.year:
-                    year_start = datetime(current.year, 1, 1)
-                    year_end = datetime(current.year + 1, 1, 1)
-                    label = f"{current.year}"
-
-                    collection = ee.ImageCollection('projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m_TS') \
-                        .filterDate(year_start.strftime("%Y-%m-%d"), year_end.strftime("%Y-%m-%d"))
-
-                    if collection.size().getInfo() == 0:
-                        self.log_status(f"[Skipped] No data for {label}")
-                        current = datetime(current.year + 1, 1, 1)
-                        continue
-
-                    image = collection.mosaic().remap(
-                        [1, 2, 3, 5, 7, 8, 9, 10, 11],
-                        [1, 2, 3, 4, 5, 6, 7, 8, 9]
-                    ).rename('lc')
-
-                    tile_list = ee.List.sequence(0, x_tiles - 1).map(lambda i:
-                                                                     ee.List.sequence(0, y_tiles - 1).map(lambda j:
-                                                                                                          ee.Dictionary(
-                                                                                                              {'i': i,
-                                                                                                               'j': j})
-                                                                                                          )
-                                                                     ).flatten()
-
-                    def check_tile(tile):
-                        tile = ee.Dictionary(tile)
-                        i = ee.Number(tile.get('i'))
-                        j = ee.Number(tile.get('j'))
-
-                        xmin = ee.Number(minx).add(i.multiply(tile_deg))
-                        ymin = ee.Number(miny).add(j.multiply(tile_deg))
-                        xmax = xmin.add(tile_deg)
-                        ymax = ymin.add(tile_deg)
-
-                        tile_geom = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
-                        tile_image = image.clip(tile_geom)
-                        band_count = tile_image.bandNames().size()
-                        intersect_area = roi.intersection(tile_geom, ee.ErrorMargin(1)).area()
-
-                        return ee.Algorithms.If(
-                            band_count.gt(0).And(intersect_area.gt(1000)),
-                            tile.set('xmin', xmin).set('ymin', ymin).set('i', i).set('j', j),
-                            None
-                        )
-
-                    all_tiles = tile_list.map(check_tile)
-                    valid_tiles = all_tiles.removeAll([None])
-                    valid_tile_data = valid_tiles.getInfo()
-
-                    total_downloads = len(valid_tile_data)
-                    current_download = 0
-                    futures = []
-
-                    for tile in valid_tile_data:
-                        i = tile['i']
-                        j = tile['j']
-                        xmin = tile['xmin']
-                        ymin = tile['ymin']
-                        xmax = xmin + tile_deg
-                        ymax = ymin + tile_deg
-
-                        tile_geom = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
-                        filename = f"land_cover_{country.replace(' ', '_')}_{label}_tile_{i}_{j}.tif"
-                        path = os.path.join(output_folder, filename)
-
-                        self.log_status(f"Queueing download: {filename}")
-                        futures.append(executor.submit(download_tile, image, tile_geom, path, filename))
-
-                    for f in as_completed(futures):
-                        _ = f.result()
-                        current_download += 1
-                        self.progress_bar['value'] = (current_download / total_downloads) * 100
-                        self.progress_bar.update_idletasks()
-
-                    current = datetime(current.year + 1, 1, 1)
-
-            self.log_status("Tiled local export complete.")
-            self.progress_bar['value'] = 100
-            self.progress_bar.update_idletasks()
-
-        except Exception as e:
-            self.log_status(f"[ERROR] {e}")
-            messagebox.showerror("Export Error", str(e))
+        start = int(self.classifier.start_year_var.get())
+        end = int(self.classifier.end_year_var.get())
+        # clear status
+        self.status_text.after(0, lambda: self.status_text.delete("1.0", tk.END))
+        # start analysis in thread
+        threading.Thread(
+            target=lambda: run_ndvi_analysis(
+                country_name=country,
+                start_year=start,
+                end_year=end,
+                log_fn=self.log_status,
+                progress_fn=lambda v: self.progress_bar.config(value=v),
+                display_frame=self.right_panel
+            ),
+            daemon=True
+        ).start()
 
 if __name__ == "__main__":
     root = tk.Tk()
