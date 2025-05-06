@@ -1,6 +1,7 @@
 import os
 import matplotlib.pyplot as plt
 from tkinter import ttk, filedialog
+import pandas as pd
 import tkinter as tk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from area_count_graph import process_folder, generate_graph
@@ -35,13 +36,24 @@ class GraphCreator:
             self._set_progress(0)
             self.log("Computing EE-based forest time series...")
 
-            from earth_engine_graph import compute_forest_area_time_series  # <- import it
+            from earth_engine_graph import compute_forest_area_time_series
+            if not hasattr(self, "classifier") or not self.classifier:
+                raise RuntimeError("Classifier module not attached to graph viewer")
+
             start = int(self.classifier.start_year_var.get())
             end = int(self.classifier.end_year_var.get())
             use_custom = self.classifier.use_custom_classifier.get()
             country = self.classifier.country_var.get()
 
-            df = compute_forest_area_time_series(country, list(range(start, end + 1)), use_custom)
+            self.log(f"Running from {start} to {end}, custom: {use_custom}")
+
+            df = compute_forest_area_time_series(
+                country,
+                list(range(start, end + 1)),
+                use_custom,
+                log_fn=self.log,
+                progress_fn=self._set_progress
+            )
             self._set_progress(50)
 
             fig = self._generate_plot(df)
@@ -55,9 +67,12 @@ class GraphCreator:
 
             self._set_progress(100)
             self.log("EE forest graph loaded.")
+
         except Exception as e:
+            import traceback
             self._set_progress(0)
-            self.log(f"[EE Graph Error] {e}")
+            tb = traceback.format_exc()
+            self.log(f"[EE Graph Error] {e}\n{tb}")
 
     def _choose_folder(self):
         folder = filedialog.askdirectory()
@@ -104,15 +119,25 @@ class GraphCreator:
             self.log(f"[GraphCreator] Error: {e}")
 
     def _generate_plot(self, df):
-        df['Year'] = df['Date'].dt.to_period('Y')
-        group = df.groupby('Year').agg({col: 'sum' for col in df.columns if col not in ['Date', 'Month']})
+        df['Year'] = df['Date'].dt.year
+
+        cols_to_plot = [
+            col for col in df.columns
+            if col not in ['Date', 'Month', 'Year'] and pd.api.types.is_numeric_dtype(df[col])
+        ]
+
+        group = df.groupby('Year')[cols_to_plot].sum()
 
         fig, ax = plt.subplots(figsize=(12, 6))
-        group.plot(kind='bar', stacked=True, ax=ax)
+        self.log(f"EE Graph Data:\n{df}")
+        group.plot(ax=ax, marker='o')
+
+        ax.set_xlabel("Year")
         ax.set_ylabel("Area (sq km)")
-        ax.set_title("Land Cover Area Over Time (Yearly)")
-        ax.grid(axis='y')
+        ax.set_title("Land Cover Area Over Time")
+        ax.grid(True)
         plt.tight_layout()
+
         return fig
 
     def export_graph(self):

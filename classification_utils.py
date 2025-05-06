@@ -38,8 +38,8 @@ def build_custom_forest_image(year: int, roi: ee.Geometry) -> ee.Image:
                  .median())
     # 2) Compute NDVI and define masks
     ndvi = composite.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI')
-    forest_mask = ndvi.gte(0.45)
-    nonforest_mask = ndvi.lte(0.25)
+    forest_mask = ndvi.gte(0.35)
+    nonforest_mask = ndvi.lte(0.15)
     # 3) Prepare training data
     bands = ['SR_B2','SR_B3','SR_B4','SR_B5','SR_B6','SR_B7']
     features = composite.select(bands).addBands(ndvi)

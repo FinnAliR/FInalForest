@@ -159,7 +159,7 @@ def export_local_yearly_landcover(
         for year in years:
             # Honor cancel before each year
             if cancel_event and cancel_event.is_set():
-                log_fn(f"⚠️ Local export canceled before building year {year}")
+                log_fn(f"Local export canceled before building year {year}")
                 break
 
             log_fn(f"Building classification for {year}.")
